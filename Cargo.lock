@@ -691,6 +691,7 @@ dependencies = [
  "base64",
  "hyper",
  "hyper-tls",
+ "log",
  "pretty_env_logger",
  "serde_json",
  "tokio",
