@@ -4,18 +4,31 @@ extern crate pretty_env_logger;
 extern crate hyper;
 extern crate hyper_tls;
 extern crate serde_json;
+extern crate tokio;
 extern crate uuid;
+extern crate dashmap;
 
+use dashmap::DashMap;
+
+use std::collections::HashMap;
 use std::env;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::io::prelude::*;
 use std::fs::File;
+use std::sync::Arc;
 
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Client, Method, Request, Response, Server, StatusCode};
 use hyper::body::Buf;
 use hyper_tls::HttpsConnector;
+
+use tokio::task;
+use tokio::sync::{
+    Mutex,
+    RwLock,
+    mpsc,
+};
 
 use uuid::Uuid;
 
@@ -42,12 +55,23 @@ const COMMENT_JOB_START: &'static str = ":running_man: Start running build job";
 const COMMENT_JOB_DONE: &'static str = "✅ Job Completed";
 
 #[derive(Debug)]
+enum JobStatus {
+    Created,
+    Running,
+    Failed,
+    Finished,
+    Canceled,
+}
+
+#[derive(Debug)]
 struct JobDesc {
+    id: Uuid,
     action: String,
     reviewer: String,
     sha: String,
     pr_num: u64,
     head_ref: String,
+    status: JobStatus,
 }
 
 fn fetch_secret_content(path: &str) -> Result<String, String> {
@@ -107,9 +131,9 @@ async fn post_comment(comment: String, pr_number: u64) -> Result<(), String> {
     }
 }
 
-fn bad_req() -> Response<Body> {
+fn gen_response(code: u16) -> Response<Body> {
     let mut resp = Response::default();
-    *resp.status_mut() = StatusCode::from_u16(400).unwrap();
+    *resp.status_mut() = StatusCode::from_u16(code).unwrap();
     resp
 }
 
@@ -177,151 +201,205 @@ fn remote_test_rust_repo(output: &mut File) -> Result<(), String> {
     remote_cmd(&mut cmd, output)
 }
 
-async fn job_failure_handler<T: std::fmt::Display>(msg: &str, job_id: &Uuid, job: &JobDesc, err: T) {
+async fn job_failure_handler<T: std::fmt::Display>(
+    msg: &str,
+    job: &JobDesc,
+    err: T,
+    ) -> Result<(), String> {
     let err_msg = format!("❌ Build job {} failed, access build log [here]({}/{}): {}: {}",
-    job_id, BUILD_LOG_BASE_URL, job_id, msg, err);
+    &job.id, BUILD_LOG_BASE_URL, &job.id, msg, err);
     error!("{}", &err_msg);
     if let Err(e) = post_comment(err_msg, job.pr_num).await {
-        warn!("unable to post comment for failed job: {}", e);
+        Err(format!("unable to post comment for failed job: {}", e))
     } else {
-        info!("Ack job finished");
+        info!("job_failure_handler exited");
+        Ok(())
     }
 }
 
-async fn run_and_build(job_id: Uuid, job: JobDesc) {
+async fn run_and_build(job: &mut JobDesc) -> Result<(), String> {
     // TODO(azhng): figure out how to perform additional cleanup.
 
-    let log_file_name = format!("{}/{}/{}", env::var("HOME").unwrap(), SEXXI_LOG_FILE_DIR, &job_id);
+    let log_file_name = format!("{}/{}/{}", env::var("HOME").unwrap(), SEXXI_LOG_FILE_DIR, &job.id);
     let log_file_path = Path::new(&log_file_name);
     info!("Creating log file at: {}", &log_file_name);
     let mut log_file = File::create(&log_file_path).unwrap();
     let bot_ref = format!("bot-{}", &job.head_ref);
 
     if let Err(e) = remote_git_reset_branch(&mut log_file) {
-        job_failure_handler("unable to reset branch", &job_id, &job, e).await;
-        return;
+        return job_failure_handler("unable to reset branch", &job, e).await;
     }
 
     if let Err(e) = remote_git_fetch_upstream(&mut log_file) {
-        job_failure_handler("unable to fetch upstream", &job_id, &job, e).await;
-        return;
+        return job_failure_handler("unable to fetch upstream", &job, e).await;
     }
 
     if let Err(e) = remote_git_checkout_sha(&job.sha, &bot_ref, &mut log_file) {
-        job_failure_handler("unable to check out commit", &job_id, &job, e).await;
-        return;
+        return job_failure_handler("unable to check out commit", &job, e).await;
     }
 
     if let Err(e) = remote_git_rebase_upstream(&mut log_file) {
-        job_failure_handler("unable to rebase against upstream", &job_id, &job, e).await;
-        return;
+        return job_failure_handler("unable to rebase against upstream", &job, e).await;
     }
 
-    if let Err(e) = remote_test_rust_repo(&mut log_file) {
-        remote_git_reset_branch(&mut log_file).expect("Ok");
-        remote_git_delete_branch(&bot_ref, &mut log_file).expect("Ok");
-        job_failure_handler("unit test failed", &job_id, &job, e).await;
-        return;
-    }
+    info!("Skipping running test for development");
+    //if let Err(e) = remote_test_rust_repo(&mut log_file) {
+    //    remote_git_reset_branch(&mut log_file).expect("Ok");
+    //    remote_git_delete_branch(&bot_ref, &mut log_file).expect("Ok");
+    //    return job_failure_handler("unit test failed", &job, e).await;
+    //}
 
     if let Err(e) = remote_git_push(&bot_ref, &mut log_file) {
-        job_failure_handler("unable to push bot branch", &job_id, &job, e).await;
-        return;
+        return job_failure_handler("unable to push bot branch", &job, e).await;
     }
 
     if let Err(e) = remote_git_reset_branch(&mut log_file) {
-        job_failure_handler("unable to reset branch for clean up", &job_id, &job, e).await;
-        return;
+        return job_failure_handler("unable to reset branch for clean up", &job, e).await;
     }
 
     if let Err(e) = remote_git_delete_branch(&bot_ref, &mut log_file) {
-        job_failure_handler("unable to delete bot branch", &job_id, &job, e).await;
-        return;
+        return job_failure_handler("unable to delete bot branch", &job, e).await;
     }
 
-    let msg = format!("{}, access build log [here]({}/{})", COMMENT_JOB_DONE, BUILD_LOG_BASE_URL, &job_id);
+    let msg = format!("{}, access build log [here]({}/{})", COMMENT_JOB_DONE, BUILD_LOG_BASE_URL, &job.id);
     info!("{}", &msg);
     if let Err(e) = post_comment(msg, job.pr_num).await {
         warn!("failed to post comment for job completion: {}", e);
     } else {
         info!("Ack job finished");
     }
+    Ok(())
 }
 
 
-async fn start_build_job(job: JobDesc) {
-    let job_id = Uuid::new_v4();
-    let comment = format!("{}, job id: {}", COMMENT_JOB_START, job_id);
-    match post_comment(comment, job.pr_num).await {
-        Ok(_) => {}
-        Err(e) => {
-            error!("Failed to start job for sha {}: {}", &job.sha, e);
-            return;
-        }
+async fn start_build_job(job: &mut JobDesc) -> Result<(), String> {
+    let comment = format!("{}, job id: {}", COMMENT_JOB_START, &job.id);
+    if let Err(e) = post_comment(comment, job.pr_num).await {
+        return Err(format!("failed to post comment to pr {}: {}", &job.pr_num, e));
     }
-    tokio::spawn(async move {
-        info!("Kicking of job for sha: {}", &job.sha);
-        run_and_build(job_id, job).await;
-    });
+    job.status = JobStatus::Running;
+    run_and_build(job).await
 }
 
-async fn handler(req: Request<Body>) -> Result<Response<Body>, hyper::Error> {
-    match (req.method(), req.uri().path()) {
-        (&Method::POST, "/github") => {
-            let mut body = hyper::body::aggregate::<Request<Body>>(req).await?;
-            let bytes = body.to_bytes();
-            let blob: Result<serde_json::Value, serde_json::Error> = serde_json::from_slice(&bytes);
+async fn parse_and_handle(
+    json: serde_json::Value,
+    jobs: &mut Arc<DashMap<Uuid, JobDesc>>,
+    sender: &mut mpsc::Sender<Uuid>,
+    ) -> Result<Response<Body>, hyper::Error> {
+    let reviewer = json["requested_reviewer"]["login"].as_str().unwrap();
+    let action = json["action"].as_str().unwrap();
 
-            match blob {
-                Ok(json) => {
-                    let reviewer = json["requested_reviewer"]["login"].as_str().unwrap();
-                    let action = json["action"].as_str().unwrap();
+    if reviewer == REVIEWER {
+        match action {
+            REVIEW_REQUESTED => {
+                let pr_number = json["pull_request"]["number"].as_u64().unwrap();
+                let sha = json["pull_request"]["head"]["sha"].as_str().unwrap();
+                let head_ref = json["pull_request"]["head"]["ref"].as_str().unwrap();
 
-                    if reviewer == REVIEWER {
-                        match action {
-                            REVIEW_REQUESTED => {
-                                let pr_number = json["pull_request"]["number"].as_u64().unwrap();
-                                let sha = json["pull_request"]["head"]["sha"].as_str().unwrap();
-                                let head_ref = json["pull_request"]["head"]["ref"].as_str().unwrap();
+                let job_id = Uuid::new_v4();
 
-                                let job = JobDesc{
-                                    action: String::from(action),
-                                    reviewer: String::from(reviewer),
-                                    sha: String::from(sha),
-                                    pr_num: pr_number,
-                                    head_ref: String::from(head_ref),
-                                };
+                let job = JobDesc{
+                    id: job_id.clone(),
+                    action: String::from(action),
+                    reviewer: String::from(reviewer),
+                    sha: String::from(sha),
+                    pr_num: pr_number,
+                    head_ref: String::from(head_ref),
+                    status: JobStatus::Created,
+                };
 
-                                // TODO(azhng): track the jobs somehow.
-                                start_build_job(job).await;
-                            },
-                            _ => {
-                                warn!("Action: {} not handled", action);
-                            }
-                        }
-                    }
-                    Ok::<_, hyper::Error>(Response::default())
-                }
-                Err(e) => {
-                    error!("parsing error: {}", e);
-                    Ok::<_, hyper::Error>(bad_req())
-                }
+                jobs.insert(job.id, job);
+
+                if let Err(e) = sender.send(job_id).await {
+                    error!("failed to send job id to job runner: {}", e);
+                    return Ok::<_, hyper::Error>(gen_response(500));
+                };
+            },
+            _ => {
+                warn!("Action: {} not handled", action);
             }
-
-        }
-
-        _ => {
-            Ok::<_, hyper::Error>(bad_req())
         }
     }
+    Ok::<_, hyper::Error>(Response::default())
+}
+
+async fn handle_webhook(
+    req: Request<Body>,
+    jobs: &mut Arc<DashMap<Uuid, JobDesc>>,
+    sender: &mut mpsc::Sender<Uuid>,
+    ) -> Result<Response<Body>, hyper::Error> {
+    let mut body = hyper::body::aggregate::<Request<Body>>(req).await?;
+    let bytes = body.to_bytes();
+    let blob: Result<serde_json::Value, serde_json::Error> = serde_json::from_slice(&bytes);
+
+    match blob {
+        Ok(json) => parse_and_handle(json, jobs, sender).await,
+        Err(e) => {
+            error!("parsing error: {}", e);
+            Ok::<_, hyper::Error>(gen_response(400))
+        }
+    }
+}
+
+async fn handle_jobs(
+    _req: Request<Body>,
+    jobs: &Arc<DashMap<Uuid, JobDesc>>,
+    ) -> Result<Response<Body>, hyper::Error> {
+    match Response::builder()
+        .status(200)
+        .body(Body::from(format!("{:#?}", jobs))) {
+            Ok(resp) => Ok(resp),
+            Err(e) => {
+                error!("internal error on job query: {}", e);
+                Ok::<_, hyper::Error>(gen_response(500))
+            }
+        }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     pretty_env_logger::init();
 
-    let make_svc = make_service_fn(|_| async {
-        Ok::<_, hyper::Error>(service_fn(handler))
+    let jobs: DashMap<Uuid, JobDesc> = DashMap::new();
+    let sync_jobs = Arc::new(jobs);
+
+    let (tx, mut rx): (mpsc::Sender<Uuid>, mpsc::Receiver<Uuid>) =
+                       mpsc::channel(100);
+
+    let runner_jobs = sync_jobs.clone();
+    let job_runner = task::spawn(async move {
+        while let Some(job_id) = rx.recv().await {
+            info!("Starting job {}", &job_id);
+
+            if let Some(mut job) = runner_jobs.get_mut(&job_id) {
+                if let Err(e) = start_build_job(job.value_mut()).await {
+                    job.status = JobStatus::Failed;
+                    error!("job {} failed due to: {}", &job_id, e);
+                } else {
+                    job.status = JobStatus::Finished;
+                }
+            } else {
+                error!("job {} not found in job registry", job_id);
+            }
+        }
+    });
+
+    let make_svc = make_service_fn(move |_| {
+        let svc_jobs = sync_jobs.clone();
+        let svc_sender = tx.clone();
+        async move {
+            Ok::<_, hyper::Error>(service_fn(move |req| {
+                let mut jobs = svc_jobs.clone();
+                let mut sender = svc_sender.clone();
+                async move {
+                    match (req.method(), req.uri().path()) {
+                        (&Method::POST, "/github") => handle_webhook(req, &mut jobs, &mut sender).await,
+                        (&Method::GET, "/jobs") => handle_jobs(req, &jobs).await,
+                        _ => Ok::<_, hyper::Error>(gen_response(400))
+                    }
+                }
+            }))
+        }
     });
 
     let addr = ([127, 0, 0, 1], 55420).into();
@@ -340,8 +418,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     SEXXI_GIT_DIR, SEXXI_PROJECT, SEXXI_REMOTE_HOST,
     SEXXI_LOG_FILE_DIR, BUILD_LOG_BASE_URL);
 
-    if let Err(err) = server.await {
-        error!("server error: {}", err);
+
+    if let (Err(e), _) = tokio::join!(
+        server,
+        job_runner,
+        ) {
+        error!("Server error: {}", e);
     }
 
     Ok(())
