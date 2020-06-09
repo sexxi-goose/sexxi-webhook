@@ -42,6 +42,10 @@ impl JobDesc {
             status: JobStatus::Created,
         }
     }
+
+    pub fn build_log_url(&self) -> String {
+        format!("{}/{}", config::BUILD_LOG_BASE_URL, &self.id)
+    }
 }
 
 pub type JobRegistry = HashMap<Uuid, JobDesc>;
@@ -101,12 +105,17 @@ async fn job_failure_handler<T: std::fmt::Display>(
     let err_msg = format!("❌ Build job {} failed, access build log [here]({}/{}): {}: {}",
     &job.id, config::BUILD_LOG_BASE_URL, &job.id, msg, err);
     error!("{}", &err_msg);
-    if let Err(e) = api::post_comment(err_msg, job.pr_num).await {
-        Err(format!("unable to post comment for failed job: {}", e))
-    } else {
-        info!("job_failure_handler exited");
-        Ok(())
+
+    if let Err(e) = api::post_comment(&err_msg, job.pr_num).await {
+        return Err(format!("unable to post comment for failed job: {}", e));
     }
+
+    if let Err(e) = api::update_commit_status(&job.sha, api::COMMIT_FAILURE, msg, &job.build_log_url()).await {
+        return Err(format!("unable to update commit status for failed job: {}", e));
+    }
+
+    info!("job_failure_handler exited");
+    Ok(())
 }
 
 async fn run_and_build(job: &JobDesc) -> Result<(), String> {
@@ -117,6 +126,11 @@ async fn run_and_build(job: &JobDesc) -> Result<(), String> {
     info!("Creating log file at: {}", &log_file_name);
     let mut log_file = File::create(&log_file_path).unwrap();
     let bot_ref = format!("bot-{}", &job.head_ref);
+
+    if let Err(e) = api::update_commit_status(&job.sha, api::COMMIT_PENDING, "Building job started", &job.build_log_url()).await {
+        return Err(format!("unable to update commit status for failed job: {}", e));
+    }
+
 
     if let Err(e) = cmd::remote_git_reset_branch(&mut log_file) {
         return job_failure_handler("unable to reset branch", &job, e).await;
@@ -154,20 +168,25 @@ async fn run_and_build(job: &JobDesc) -> Result<(), String> {
         return job_failure_handler("unable to delete bot branch", &job, e).await;
     }
 
-    let msg = format!("{}, access build log [here]({}/{})", config::COMMENT_JOB_DONE, config::BUILD_LOG_BASE_URL, &job.id);
+    let msg = format!("{}, access build log [here]({})", config::COMMENT_JOB_DONE, job.build_log_url());
     info!("{}", &msg);
-    if let Err(e) = api::post_comment(msg, job.pr_num).await {
+    if let Err(e) = api::post_comment(&msg, job.pr_num).await {
         warn!("failed to post comment for job completion: {}", e);
-    } else {
-        info!("Ack job finished");
     }
+
+    if let Err(e) = api::update_commit_status(&job.sha, api::COMMIT_SUCCESS, &msg, &job.build_log_url()).await {
+        return Err(format!("unable to update commit status for failed job: {}", e));
+    }
+
+
+    info!("Ack job finished");
     Ok(())
 }
 
 
 async fn start_build_job(job: &JobDesc) -> Result<(), String> {
     let comment = format!("{}, job id: {}", config::COMMENT_JOB_START, &job.id);
-    if let Err(e) = api::post_comment(comment, job.pr_num).await {
+    if let Err(e) = api::post_comment(&comment, job.pr_num).await {
         return Err(format!("failed to post comment to pr {}: {}", &job.pr_num, e));
     }
     run_and_build(job).await

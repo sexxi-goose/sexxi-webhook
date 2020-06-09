@@ -176,7 +176,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let server = Server::bind(&addr).serve(make_svc);
 
     info!("Listening to http://{}", addr);
-    info!(r"Server Ready. Configuration:
+    info!(r"
+Server Ready. Configuration:
     SEXXI_USERNAME: {},
     SEXXI_WORK_TREE: {},
     SEXXI_GIT_DIR: {},
