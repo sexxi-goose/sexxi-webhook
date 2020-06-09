@@ -6,11 +6,7 @@ extern crate hyper_tls;
 extern crate serde_json;
 extern crate tokio;
 extern crate uuid;
-extern crate dashmap;
 
-use dashmap::DashMap;
-
-use std::collections::HashMap;
 use std::env;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -25,12 +21,14 @@ use hyper_tls::HttpsConnector;
 
 use tokio::task;
 use tokio::sync::{
-    Mutex,
     RwLock,
     mpsc,
 };
 
 use uuid::Uuid;
+
+mod job;
+use job::*;
 
 // TODO(azhng): check repo name.
 const REVIEW_REQUESTED: &'static str = "review_requested";
@@ -49,30 +47,11 @@ const SEXXI_PROJECT: &'static str = "rust";
 const SEXXI_REMOTE_HOST: &'static str = "sorbitol";
 const SEXXI_LOG_FILE_DIR: &'static str = "www/build-logs";
 
+// TODO(azhng): maybe we need to template out the user name here.
 const BUILD_LOG_BASE_URL: &'static str = "https://csclub.uwaterloo.ca/~z577zhan/build-logs";
 
 const COMMENT_JOB_START: &'static str = ":running_man: Start running build job";
 const COMMENT_JOB_DONE: &'static str = "✅ Job Completed";
-
-#[derive(Debug)]
-enum JobStatus {
-    Created,
-    Running,
-    Failed,
-    Finished,
-    Canceled,
-}
-
-#[derive(Debug)]
-struct JobDesc {
-    id: Uuid,
-    action: String,
-    reviewer: String,
-    sha: String,
-    pr_num: u64,
-    head_ref: String,
-    status: JobStatus,
-}
 
 fn fetch_secret_content(path: &str) -> Result<String, String> {
     match File::open(path) {
@@ -217,7 +196,7 @@ async fn job_failure_handler<T: std::fmt::Display>(
     }
 }
 
-async fn run_and_build(job: &mut JobDesc) -> Result<(), String> {
+async fn run_and_build(job: &JobDesc) -> Result<(), String> {
     // TODO(azhng): figure out how to perform additional cleanup.
 
     let log_file_name = format!("{}/{}/{}", env::var("HOME").unwrap(), SEXXI_LOG_FILE_DIR, &job.id);
@@ -242,6 +221,7 @@ async fn run_and_build(job: &mut JobDesc) -> Result<(), String> {
         return job_failure_handler("unable to rebase against upstream", &job, e).await;
     }
 
+    // TODO(azhng): make this a runtime decision.
     info!("Skipping running test for development");
     //if let Err(e) = remote_test_rust_repo(&mut log_file) {
     //    remote_git_reset_branch(&mut log_file).expect("Ok");
@@ -272,20 +252,23 @@ async fn run_and_build(job: &mut JobDesc) -> Result<(), String> {
 }
 
 
-async fn start_build_job(job: &mut JobDesc) -> Result<(), String> {
+async fn start_build_job(job: &JobDesc) -> Result<(), String> {
     let comment = format!("{}, job id: {}", COMMENT_JOB_START, &job.id);
     if let Err(e) = post_comment(comment, job.pr_num).await {
         return Err(format!("failed to post comment to pr {}: {}", &job.pr_num, e));
     }
-    job.status = JobStatus::Running;
     run_and_build(job).await
 }
 
 async fn parse_and_handle(
     json: serde_json::Value,
-    jobs: &mut Arc<DashMap<Uuid, JobDesc>>,
+    jobs: Arc<RwLock<JobRegistry>>,
     sender: &mut mpsc::Sender<Uuid>,
     ) -> Result<Response<Body>, hyper::Error> {
+
+
+    // TODO(azhng): the unwrap here can cause panic. This is because we are recieving
+    //   other webhooks other than just PR requesting reviews.
     let reviewer = json["requested_reviewer"]["login"].as_str().unwrap();
     let action = json["action"].as_str().unwrap();
 
@@ -296,19 +279,11 @@ async fn parse_and_handle(
                 let sha = json["pull_request"]["head"]["sha"].as_str().unwrap();
                 let head_ref = json["pull_request"]["head"]["ref"].as_str().unwrap();
 
-                let job_id = Uuid::new_v4();
+                let job = JobDesc::new(&action, &reviewer, &sha, pr_number, &head_ref);
+                let job_id  = job.id.clone();
 
-                let job = JobDesc{
-                    id: job_id.clone(),
-                    action: String::from(action),
-                    reviewer: String::from(reviewer),
-                    sha: String::from(sha),
-                    pr_num: pr_number,
-                    head_ref: String::from(head_ref),
-                    status: JobStatus::Created,
-                };
-
-                jobs.insert(job.id, job);
+                let mut jobs = jobs.write().await;
+                jobs.insert(job_id.clone(), job);
 
                 if let Err(e) = sender.send(job_id).await {
                     error!("failed to send job id to job runner: {}", e);
@@ -325,7 +300,7 @@ async fn parse_and_handle(
 
 async fn handle_webhook(
     req: Request<Body>,
-    jobs: &mut Arc<DashMap<Uuid, JobDesc>>,
+    jobs: Arc<RwLock<JobRegistry>>,
     sender: &mut mpsc::Sender<Uuid>,
     ) -> Result<Response<Body>, hyper::Error> {
     let mut body = hyper::body::aggregate::<Request<Body>>(req).await?;
@@ -343,11 +318,47 @@ async fn handle_webhook(
 
 async fn handle_jobs(
     _req: Request<Body>,
-    jobs: &Arc<DashMap<Uuid, JobDesc>>,
+    jobs: Arc<RwLock<JobRegistry>>,
     ) -> Result<Response<Body>, hyper::Error> {
+    let jobs = &*jobs.read().await;
+    let mut output = String::new();
+
+    output.push_str("<table style=\"width:100%;border:1px solid black;margin-left:auto;margin-right:auto;\">");
+    {
+        output.push_str("<tr>");
+        {
+            output.push_str("<th>Job ID</th>");
+            output.push_str("<th>Action</th>");
+            output.push_str("<th>Reviewer</th>");
+            output.push_str("<th>SHA</th>");
+            output.push_str("<th>PR Number</th>");
+            output.push_str("<th>Head Ref</th>");
+            output.push_str("<th>Status</th>");
+        }
+        output.push_str("</tr>");
+
+        for (_, job) in jobs {
+            output.push_str("<tr>");
+            {
+                // TODO(azhng): hyper link this.
+                output.push_str(&format!("<td>{}</td>", job.id));
+                output.push_str(&format!("<td>{}</td>", job.action));
+                output.push_str(&format!("<td>{}</td>", job.reviewer));
+                output.push_str(&format!("<td>{}</td>", job.sha));
+                output.push_str(&format!("<td>{}</td>", job.pr_num));
+                output.push_str(&format!("<td>{}</td>", job.head_ref));
+                output.push_str(&format!("<td>{:?}</td>", job.status));
+            }
+            output.push_str("</tr>");
+        }
+
+    }
+    output.push_str("</table>");
+
     match Response::builder()
         .status(200)
-        .body(Body::from(format!("{:#?}", jobs))) {
+        .header("Content-Type", "text/html")
+        .body(Body::from(output)) {
             Ok(resp) => Ok(resp),
             Err(e) => {
                 error!("internal error on job query: {}", e);
@@ -360,8 +371,8 @@ async fn handle_jobs(
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     pretty_env_logger::init();
 
-    let jobs: DashMap<Uuid, JobDesc> = DashMap::new();
-    let sync_jobs = Arc::new(jobs);
+    let mut jobs  = JobRegistry::new();
+    let sync_jobs = Arc::new(RwLock::new(jobs));
 
     let (tx, mut rx): (mpsc::Sender<Uuid>, mpsc::Receiver<Uuid>) =
                        mpsc::channel(100);
@@ -371,15 +382,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         while let Some(job_id) = rx.recv().await {
             info!("Starting job {}", &job_id);
 
-            if let Some(mut job) = runner_jobs.get_mut(&job_id) {
-                if let Err(e) = start_build_job(job.value_mut()).await {
-                    job.status = JobStatus::Failed;
-                    error!("job {} failed due to: {}", &job_id, e);
+            let mut succeed = false;
+
+            // We break these into separate blocks is to avoid lock contention.
+            // we need a write lock here but start_build_job is very expensive.
+            // this can blocks our HTTP endpoint for /jobs. Therefore when we
+            // start running the build job we release the write lock and acquire
+            // and read lock so that other HTTP endpoint won't be blocked.
+            // TODO(azhng): write a macro for this. This can be easily genealized.
+            {
+                let mut rw = runner_jobs.write().await;
+                if let Some(job) = rw.get_mut(&job_id) {
+                    job.status = JobStatus::Running;
                 } else {
-                    job.status = JobStatus::Finished;
+                    error!("Job info for {} corrupted or missing", &job_id)
                 }
-            } else {
-                error!("job {} not found in job registry", job_id);
+            }
+
+            {
+                let rw = runner_jobs.read().await;
+                if let Some(job) = rw.get(&job_id) {
+                    if let Err(e) = start_build_job(job).await {
+                        error!("job {} failed due to: {}", &job_id, e);
+                    } else {
+                        succeed = true;
+                    }
+                } else {
+                    error!("Job info for {} corrupted or missing", &job_id)
+                }
+            }
+
+            {
+                let mut rw = runner_jobs.write().await;
+                if let Some(job) = rw.get_mut(&job_id) {
+                    if succeed {
+                        job.status = JobStatus::Finished;
+                    } else {
+                        job.status = JobStatus::Failed;
+                    }
+                } else {
+                    error!("Job info for {} corrupted or missing", &job_id)
+                }
             }
         }
     });
@@ -389,12 +432,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let svc_sender = tx.clone();
         async move {
             Ok::<_, hyper::Error>(service_fn(move |req| {
-                let mut jobs = svc_jobs.clone();
+                let jobs = svc_jobs.clone();
                 let mut sender = svc_sender.clone();
                 async move {
                     match (req.method(), req.uri().path()) {
-                        (&Method::POST, "/github") => handle_webhook(req, &mut jobs, &mut sender).await,
-                        (&Method::GET, "/jobs") => handle_jobs(req, &jobs).await,
+                        (&Method::POST, "/github") => handle_webhook(req, jobs, &mut sender).await,
+                        (&Method::GET, "/jobs") => handle_jobs(req, jobs).await,
                         _ => Ok::<_, hyper::Error>(gen_response(400))
                     }
                 }
