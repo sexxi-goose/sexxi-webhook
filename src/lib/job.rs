@@ -48,51 +48,44 @@ impl JobDesc {
     }
 }
 
-pub type JobRegistry = HashMap<Uuid, JobDesc>;
+pub type JobRegistry = HashMap<Uuid, Arc<RwLock<JobDesc>>>;
 
 pub async fn process_job(job_id: &Uuid, jobs: Arc<RwLock<JobRegistry>>) {
     info!("Starting job {}", &job_id);
 
     let mut succeed = false;
-
-    // We break these into separate blocks is to avoid lock contention.
-    // we need a write lock here but start_build_job is very expensive.
-    // this can blocks our HTTP endpoint for /jobs. Therefore when we
-    // start running the build job we release the write lock and acquire
-    // and read lock so that other HTTP endpoint won't be blocked.
-    // TODO(azhng): write a macro for this. This can be easily genealized.
-    {
-        let mut rw = jobs.write().await;
-        if let Some(job) = rw.get_mut(&job_id) {
-            job.status = JobStatus::Running;
-        } else {
-            error!("Job info for {} corrupted or missing", &job_id)
-        }
-    }
+    let job: Arc<RwLock<JobDesc>>;
 
     {
         let rw = jobs.read().await;
-        if let Some(job) = rw.get(&job_id) {
-            if let Err(e) = start_build_job(job).await {
-                error!("job {} failed due to: {}", &job_id, e);
-            } else {
-                succeed = true;
-            }
+        if let Some(j) = rw.get(&job_id) {
+            job = j.clone();
         } else {
-            error!("Job info for {} corrupted or missing", &job_id)
+            error!("Job info for {} corrupted or missing", &job_id);
+            return;
         }
     }
 
     {
-        let mut rw = jobs.write().await;
-        if let Some(job) = rw.get_mut(&job_id) {
-            if succeed {
-                job.status = JobStatus::Finished;
-            } else {
-                job.status = JobStatus::Failed;
-            }
+        let mut job = job.write().await;
+        job.status = JobStatus::Running;
+    }
+
+    {
+        let job = &*job.read().await;
+        if let Err(e) = start_build_job(job).await {
+            error!("job {} failed due to: {}", &job_id, e);
         } else {
-            error!("Job info for {} corrupted or missing", &job_id)
+            succeed = true;
+        }
+    }
+
+    {
+        let mut job = job.write().await;
+        if succeed {
+            job.status = JobStatus::Finished;
+        } else {
+            job.status = JobStatus::Failed;
         }
     }
 }
@@ -149,12 +142,12 @@ async fn run_and_build(job: &JobDesc) -> Result<(), String> {
     }
 
     // TODO(azhng): make this a runtime decision.
-    info!("Skipping running test for development");
-    //if let Err(e) = cmd::remote_test_rust_repo(&mut log_file) {
-    //    remote_git_reset_branch(&mut log_file).expect("Ok");
-    //    remote_git_delete_branch(&bot_ref, &mut log_file).expect("Ok");
-    //    return job_failure_handler("unit test failed", &job, e).await;
-    //}
+    //info!("Skipping running test for development");
+    if let Err(e) = cmd::remote_test_rust_repo(&mut log_file) {
+        cmd::remote_git_reset_branch(&mut log_file).expect("Ok");
+        cmd::remote_git_delete_branch(&bot_ref, &mut log_file).expect("Ok");
+        return job_failure_handler("unit test failed", &job, e).await;
+    }
 
     if let Err(e) = cmd::remote_git_push(&bot_ref, &mut log_file) {
         return job_failure_handler("unable to push bot branch", &job, e).await;
