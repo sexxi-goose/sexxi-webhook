@@ -7,16 +7,27 @@ fn remote_cmd(args: &mut Vec<&str>, output: &mut File) -> Result<(), String> {
     // TODO(azhng): let's finger cross this works.
     let output_file = output.try_clone().unwrap();
     let error_file = output.try_clone().unwrap();
-    let cmd = Command::new("ssh")
+    let cmd_process = Command::new("ssh")
         .arg(config::SEXXI_REMOTE_HOST)
-        .args(args)
+        .args(args.clone())
         .stdout(Stdio::from(output_file))
         .stderr(Stdio::from(error_file))
-        .output()
-        .expect("Ok");
+        .spawn();
 
-    if !cmd.status.success() {
-        return Err(format!("remote command failed: {}", cmd.status));
+    match cmd_process {
+        Ok(child) => {
+            println!("Server process with id {} is running command `{:?}`", child.id(), args);
+
+            let result = child.wait_with_output().expect("Ok");
+            if !result.status.success() {
+                return Err(format!("remote command failed: {}", result.status));
+            }
+        },
+        Err(e) => {
+            println!("Command `{:?}` failed, server process didn't start: {}", args, e);
+            std::process::exit(1);
+        },
+
     }
 
     Ok(())
@@ -34,12 +45,12 @@ pub fn remote_git_reset_branch(output: &mut File) -> Result<(), String> {
 }
 
 pub fn remote_git_fetch_upstream(output: &mut File) -> Result<(), String> {
-    let mut cmd = vec!["fetch", "--all"];
+    let mut cmd = vec!["fetch", "--all", "-p"];
     remote_git_cmd(&mut cmd, output)
 }
 
 pub fn remote_git_checkout_sha(sha: &str, bot_ref: &str, output: &mut File) -> Result<(), String> {
-    let mut cmd = vec!["checkout", sha, "-b", bot_ref];
+    let mut cmd = vec!["checkout", sha, "-B", bot_ref];
     remote_git_cmd(&mut cmd, output)
 }
 
