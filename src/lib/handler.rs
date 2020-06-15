@@ -12,6 +12,8 @@ use tokio::sync::{
 };
 use uuid::Uuid;
 use super::{config, job};
+use nix::unistd::Pid;
+use nix::sys::signal::{self, Signal};
 
 pub fn gen_response(code: u16) -> Response<Body> {
     let mut resp = Response::default();
@@ -23,13 +25,14 @@ pub async fn handle_webhook(
     req: Request<Body>,
     jobs: Arc<RwLock<job::JobRegistry>>,
     sender: &mut mpsc::Sender<Uuid>,
+    curr_job: Arc<RwLock<job::JobInfo>>
     ) -> Result<Response<Body>, hyper::Error> {
     let mut body = hyper::body::aggregate::<Request<Body>>(req).await?;
     let bytes = body.to_bytes();
     let blob: Result<serde_json::Value, serde_json::Error> = serde_json::from_slice(&bytes);
 
     match blob {
-        Ok(json) => parse_and_handle(json, jobs, sender).await,
+        Ok(json) => parse_and_handle(json, jobs, sender, &curr_job).await,
         Err(e) => {
             error!("parsing error: {}", e);
             Ok::<_, hyper::Error>(gen_response(400))
@@ -93,6 +96,7 @@ async fn parse_and_handle(
     json: serde_json::Value,
     jobs: Arc<RwLock<job::JobRegistry>>,
     sender: &mut mpsc::Sender<Uuid>,
+    curr_job: &Arc<RwLock<job::JobInfo>>
     ) -> Result<Response<Body>, hyper::Error> {
 
 
@@ -113,6 +117,17 @@ async fn parse_and_handle(
 
                 let mut jobs = jobs.write().await;
                 jobs.insert(job_id.clone(), Arc::new(RwLock::new(job)));
+
+                if head_ref == curr_job.read().await.head_ref {
+                    info!("New job on same head_ref, killing current job");
+                    // [To-Do] Fix, could potentially kill a process which is already dead
+                    signal::kill(Pid::from_raw(curr_job.read().await.pid as i32), Signal::SIGKILL);
+                } else {
+                    {
+                        let mut w_curr_job = curr_job.write().await;
+                        w_curr_job.head_ref = String::from(head_ref);
+                    }
+                }
 
                 if let Err(e) = sender.send(job_id).await {
                     error!("failed to send job id to job runner: {}", e);

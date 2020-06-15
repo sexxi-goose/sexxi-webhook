@@ -30,6 +30,11 @@ pub struct JobDesc {
     pub status: JobStatus,
 }
 
+pub struct JobInfo {
+    pub head_ref: String,
+    pub pid: u32,
+}
+
 impl JobDesc {
     pub fn new(action: &str, reviewer: &str, sha: &str, pr_num: u64, head_ref: &str) -> JobDesc {
         JobDesc {
@@ -50,7 +55,7 @@ impl JobDesc {
 
 pub type JobRegistry = HashMap<Uuid, Arc<RwLock<JobDesc>>>;
 
-pub async fn process_job(job_id: &Uuid, jobs: Arc<RwLock<JobRegistry>>) {
+pub async fn process_job(job_id: &Uuid, jobs: Arc<RwLock<JobRegistry>>, curr_job: Arc<RwLock<JobInfo>>) {
     info!("Starting job {}", &job_id);
 
     let mut succeed = false;
@@ -73,7 +78,7 @@ pub async fn process_job(job_id: &Uuid, jobs: Arc<RwLock<JobRegistry>>) {
 
     {
         let job = &*job.read().await;
-        if let Err(e) = start_build_job(job).await {
+        if let Err(e) = start_build_job(job, &curr_job).await {
             error!("job {} failed due to: {}", &job_id, e);
         } else {
             succeed = true;
@@ -111,7 +116,7 @@ async fn job_failure_handler<T: std::fmt::Display>(
     Ok(())
 }
 
-async fn run_and_build(job: &JobDesc) -> Result<(), String> {
+async fn run_and_build(job: &JobDesc, curr_job: &Arc<RwLock<JobInfo>>) -> Result<(), String> {
     // TODO(azhng): figure out how to perform additional cleanup.
 
     let log_file_name = format!("{}/{}/{}", env::var("HOME").unwrap(), config::SEXXI_LOG_FILE_DIR, &job.id);
@@ -125,39 +130,39 @@ async fn run_and_build(job: &JobDesc) -> Result<(), String> {
     }
 
 
-    if let Err(e) = cmd::remote_git_reset_branch(&mut log_file) {
+    if let Err(e) = cmd::remote_git_reset_branch(&mut log_file, curr_job).await {
         return job_failure_handler("unable to reset branch", &job, e).await;
     }
 
-    if let Err(e) = cmd::remote_git_fetch_upstream(&mut log_file) {
+    if let Err(e) = cmd::remote_git_fetch_upstream(&mut log_file, curr_job).await {
         return job_failure_handler("unable to fetch upstream", &job, e).await;
     }
 
-    if let Err(e) = cmd::remote_git_checkout_sha(&job.sha, &bot_ref, &mut log_file) {
+    if let Err(e) = cmd::remote_git_checkout_sha(&job.sha, &bot_ref, &mut log_file, curr_job).await {
         return job_failure_handler("unable to check out commit", &job, e).await;
     }
 
-    if let Err(e) = cmd::remote_git_rebase_upstream(&mut log_file) {
+    if let Err(e) = cmd::remote_git_rebase_upstream(&mut log_file, curr_job).await {
         return job_failure_handler("unable to rebase against upstream", &job, e).await;
     }
 
     // TODO(azhng): make this a runtime decision.
     //info!("Skipping running test for development");
-    if let Err(e) = cmd::remote_test_rust_repo(&mut log_file) {
-        cmd::remote_git_reset_branch(&mut log_file).expect("Ok");
-        cmd::remote_git_delete_branch(&bot_ref, &mut log_file).expect("Ok");
+    if let Err(e) = cmd::remote_test_rust_repo(&mut log_file, curr_job).await {
+        cmd::remote_git_reset_branch(&mut log_file, curr_job).await.expect("Ok");
+        cmd::remote_git_delete_branch(&bot_ref, &mut log_file, curr_job).await.expect("Ok");
         return job_failure_handler("unit test failed", &job, e).await;
     }
 
-    if let Err(e) = cmd::remote_git_push(&bot_ref, &mut log_file) {
+    if let Err(e) = cmd::remote_git_push(&bot_ref, &mut log_file, curr_job).await {
         return job_failure_handler("unable to push bot branch", &job, e).await;
     }
 
-    if let Err(e) = cmd::remote_git_reset_branch(&mut log_file) {
+    if let Err(e) = cmd::remote_git_reset_branch(&mut log_file, curr_job).await {
         return job_failure_handler("unable to reset branch for clean up", &job, e).await;
     }
 
-    if let Err(e) = cmd::remote_git_delete_branch(&bot_ref, &mut log_file) {
+    if let Err(e) = cmd::remote_git_delete_branch(&bot_ref, &mut log_file, curr_job).await {
         return job_failure_handler("unable to delete bot branch", &job, e).await;
     }
 
@@ -177,10 +182,10 @@ async fn run_and_build(job: &JobDesc) -> Result<(), String> {
 }
 
 
-async fn start_build_job(job: &JobDesc) -> Result<(), String> {
+async fn start_build_job(job: &JobDesc, curr_job: &Arc<RwLock<JobInfo>>) -> Result<(), String> {
     let comment = format!("{}, job id: {}", config::COMMENT_JOB_START, &job.id);
     if let Err(e) = api::post_comment(&comment, job.pr_num).await {
         return Err(format!("failed to post comment to pr {}: {}", &job.pr_num, e));
     }
-    run_and_build(job).await
+    run_and_build(job, curr_job).await
 }

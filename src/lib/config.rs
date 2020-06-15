@@ -15,8 +15,7 @@ pub const SEXXI_TEST_PROJECT: &'static str = "sexxi-webhook-test";
 pub const SEXXI_REMOTE_HOST: &'static str = "sorbitol";
 pub const SEXXI_LOG_FILE_DIR: &'static str = "www/build-logs";
 
-// TODO(azhng): we need to template out the user name here.
-pub const BUILD_LOG_BASE_URL: &'static str = "https://csclub.uwaterloo.ca/~[username]/build-logs";
+pub const BUILD_LOG_BASE_URL: &'static str = "https://csclub.uwaterloo.ca/~rlmmfruy/build-logs";
 
 pub const COMMENT_JOB_START: &'static str = ":running_man: Start running build job";
 pub const COMMENT_JOB_DONE: &'static str = "✅ Job Completed";
