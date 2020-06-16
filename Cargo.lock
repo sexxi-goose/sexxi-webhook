@@ -704,6 +704,7 @@ dependencies = [
  "base64",
  "hyper",
  "hyper-tls",
+ "lazy_static",
  "log",
  "nix",
  "pretty_env_logger",

@@ -23,16 +23,15 @@ pub fn gen_response(code: u16) -> Response<Body> {
 
 pub async fn handle_webhook(
     req: Request<Body>,
-    jobs: Arc<RwLock<job::JobRegistry>>,
+    job_registry: Arc<RwLock<job::JobRegistry>>,
     sender: &mut mpsc::Sender<Uuid>,
-    curr_job: & Arc<RwLock<job::JobDesc>>
     ) -> Result<Response<Body>, hyper::Error> {
     let mut body = hyper::body::aggregate::<Request<Body>>(req).await?;
     let bytes = body.to_bytes();
     let blob: Result<serde_json::Value, serde_json::Error> = serde_json::from_slice(&bytes);
 
     match blob {
-        Ok(json) => parse_and_handle(json, jobs, sender, curr_job).await,
+        Ok(json) => parse_and_handle(json, job_registry, sender).await,
         Err(e) => {
             error!("parsing error: {}", e);
             Ok::<_, hyper::Error>(gen_response(400))
@@ -42,9 +41,10 @@ pub async fn handle_webhook(
 
 pub async fn handle_jobs(
     _req: Request<Body>,
-    jobs: Arc<RwLock<job::JobRegistry>>,
+    job_registry: Arc<RwLock<job::JobRegistry>>,
     ) -> Result<Response<Body>, hyper::Error> {
-    let jobs = &*jobs.read().await;
+    let registry = job_registry.read().await;
+    let jobs = &registry.jobs;
     let mut output = String::new();
 
     output.push_str("<table style=\"width:100%;border:1px solid black;margin-left:auto;margin-right:auto;\">");
@@ -94,9 +94,8 @@ pub async fn handle_jobs(
 
 async fn parse_and_handle(
     json: serde_json::Value,
-    jobs: Arc<RwLock<job::JobRegistry>>,
+    job_registry: Arc<RwLock<job::JobRegistry>>,
     sender: &mut mpsc::Sender<Uuid>,
-    curr_job: & Arc<RwLock<job::JobDesc>>
     ) -> Result<Response<Body>, hyper::Error> {
 
 
@@ -115,19 +114,21 @@ async fn parse_and_handle(
                 let job = job::JobDesc::new(&action, &reviewer, &sha, pr_number, &head_ref);
                 let job_id  = job.id.clone();
 
-                let mut jobs = jobs.write().await;
-                let temp_job = job.clone();
-                jobs.insert(job_id.clone(), Arc::new(RwLock::new(job)));
-
-                if head_ref == curr_job.read().await.head_ref {
-                    info!("New job on same head_ref, killing current job");
-                    // [To-Do] Fix, could potentially kill a process which is already dead
-                    signal::kill(Pid::from_raw(curr_job.read().await.pid as i32), Signal::SIGKILL);
-                }
-
                 {
-                    let mut w_curr_job = curr_job.write().await;
-                    *w_curr_job = temp_job.clone();
+                    let mut job_registry = job_registry.write().await;
+                    job_registry.jobs.insert(job_id.clone(), Arc::new(RwLock::new(job)));
+                    let c_job: Arc<RwLock<job::JobDesc>>;
+                    if let Some(j) = job_registry.jobs.get(&job_registry.running_jobs) {
+                        c_job = j.clone();
+                        let curr_job = c_job.read().await;
+                        if head_ref == curr_job.head_ref {
+                            info!("New job on same head_ref, killing current job");
+                            // [To-Do] Fix, could potentially kill a process which is already dead
+                            signal::kill(Pid::from_raw(curr_job.pid as i32), Signal::SIGKILL);
+                        }
+                    }
+
+                    job_registry.running_jobs = job_id.clone();
                 }
 
                 if let Err(e) = sender.send(job_id).await {
