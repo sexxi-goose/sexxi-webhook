@@ -19,7 +19,7 @@ pub enum JobStatus {
     Canceled,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct JobDesc {
     pub id: Uuid,
     pub action: String,
@@ -28,10 +28,6 @@ pub struct JobDesc {
     pub pr_num: u64,
     pub head_ref: String,
     pub status: JobStatus,
-}
-
-pub struct JobInfo {
-    pub head_ref: String,
     pub pid: u32,
 }
 
@@ -45,6 +41,20 @@ impl JobDesc {
             pr_num: pr_num,
             head_ref: String::from(head_ref),
             status: JobStatus::Created,
+            pid: 0,
+        }
+    }
+
+    pub fn empty() -> JobDesc {
+        JobDesc {
+            id: Uuid::new_v4(),
+            action: String::from(""),
+            reviewer: String::from(""),
+            sha: String::from(""),
+            pr_num: 0,
+            head_ref: String::from(""),
+            status: JobStatus::Created,
+            pid: 0,
         }
     }
 
@@ -55,7 +65,7 @@ impl JobDesc {
 
 pub type JobRegistry = HashMap<Uuid, Arc<RwLock<JobDesc>>>;
 
-pub async fn process_job(job_id: &Uuid, jobs: Arc<RwLock<JobRegistry>>, curr_job: Arc<RwLock<JobInfo>>) {
+pub async fn process_job(job_id: &Uuid, jobs: Arc<RwLock<JobRegistry>>, curr_job: & Arc<RwLock<JobDesc>>) {
     info!("Starting job {}", &job_id);
 
     let mut succeed = false;
@@ -78,7 +88,7 @@ pub async fn process_job(job_id: &Uuid, jobs: Arc<RwLock<JobRegistry>>, curr_job
 
     {
         let job = &*job.read().await;
-        if let Err(e) = start_build_job(job, &curr_job).await {
+        if let Err(e) = start_build_job(job, curr_job).await {
             error!("job {} failed due to: {}", &job_id, e);
         } else {
             succeed = true;
@@ -116,7 +126,7 @@ async fn job_failure_handler<T: std::fmt::Display>(
     Ok(())
 }
 
-async fn run_and_build(job: &JobDesc, curr_job: &Arc<RwLock<JobInfo>>) -> Result<(), String> {
+async fn run_and_build(job: &JobDesc, curr_job: &Arc<RwLock<JobDesc>>) -> Result<(), String> {
     // TODO(azhng): figure out how to perform additional cleanup.
 
     let log_file_name = format!("{}/{}/{}", env::var("HOME").unwrap(), config::SEXXI_LOG_FILE_DIR, &job.id);
@@ -182,7 +192,7 @@ async fn run_and_build(job: &JobDesc, curr_job: &Arc<RwLock<JobInfo>>) -> Result
 }
 
 
-async fn start_build_job(job: &JobDesc, curr_job: &Arc<RwLock<JobInfo>>) -> Result<(), String> {
+async fn start_build_job(job: &JobDesc, curr_job: & Arc<RwLock<JobDesc>>) -> Result<(), String> {
     let comment = format!("{}, job id: {}", config::COMMENT_JOB_START, &job.id);
     if let Err(e) = api::post_comment(&comment, job.pr_num).await {
         return Err(format!("failed to post comment to pr {}: {}", &job.pr_num, e));

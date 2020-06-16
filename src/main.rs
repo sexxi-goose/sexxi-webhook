@@ -26,27 +26,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let jobs  = job::JobRegistry::new();
     let sync_jobs = Arc::new(RwLock::new(jobs));
+    let curr_job = Arc::new(RwLock::new(job::JobDesc::empty()));
 
     let (tx, mut rx): (mpsc::Sender<Uuid>, mpsc::Receiver<Uuid>) =
                        mpsc::channel(100);
 
     let runner_jobs = sync_jobs.clone();
+    let runner_curr_job = curr_job.clone();
     let job_runner = task::spawn(async move {
         while let Some(job_id) = rx.recv().await {
-            job::process_job(&job_id, runner_jobs.clone()).await;
+            job::process_job(&job_id, runner_jobs.clone(), &runner_curr_job).await;
         }
     });
 
     let make_svc = make_service_fn(move |_| {
         let svc_jobs = sync_jobs.clone();
         let svc_sender = tx.clone();
+        let svc_curr_job = curr_job.clone();
         async move {
             Ok::<_, hyper::Error>(service_fn(move |req| {
                 let jobs = svc_jobs.clone();
                 let mut sender = svc_sender.clone();
+                let svc_curr_job2 = svc_curr_job.clone();
                 async move {
                     match (req.method(), req.uri().path()) {
-                        (&Method::POST, "/github") => handler::handle_webhook(req, jobs, &mut sender).await,
+                        (&Method::POST, "/github") => handler::handle_webhook(req, jobs, &mut sender, & svc_curr_job2.clone()).await,
                         (&Method::GET, "/jobs") => handler::handle_jobs(req, jobs).await,
                         _ => Ok::<_, hyper::Error>(handler::gen_response(400))
                     }
