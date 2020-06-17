@@ -70,7 +70,7 @@ Server Ready. Configuration:
     BUILD_LOG_BASE_URL: {}",
     config::SEXXI_USERNAME, config::SEXXI_WORK_TREE,
     config::SEXXI_GIT_DIR, config::SEXXI_PROJECT, config::SEXXI_REMOTE_HOST,
-    config::SEXXI_LOG_FILE_DIR, config::BUILD_LOG_BASE_URL);
+    config::SEXXI_LOG_FILE_DIR, *config::BUILD_LOG_BASE_URL);
 
 
     if let (Err(e), _) = tokio::join!(

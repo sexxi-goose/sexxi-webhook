@@ -8,8 +8,8 @@ use std::io::prelude::*;
 
 use super::config;
 
-pub const COMMIT_PENDING: &'static str ="pending";
-pub const COMMIT_SUCCESS: &'static str ="success";
+pub const COMMIT_PENDING: &'static str = "pending";
+pub const COMMIT_SUCCESS: &'static str = "success";
 pub const COMMIT_FAILURE: &'static str = "failure";
 
 pub async fn post_comment(comment: &str, pr_number: u64) -> Result<(), String> {
