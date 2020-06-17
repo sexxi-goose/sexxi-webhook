@@ -1,7 +1,9 @@
-use std::env;
 use lazy_static::lazy_static;
+use std::env;
 
 pub const REVIEW_REQUESTED: &'static str = "review_requested";
+pub const REVIEW_REQUESTED_REMOVED: &'static str = "review_requested_removed";
+
 pub const REVIEWER: &'static str = "sexxi-bot";
 // TODO(azhng): const REPO: &'static str = "rust";
 
@@ -20,7 +22,8 @@ pub const SEXXI_LOG_FILE_DIR: &'static str = "www/build-logs";
 
 lazy_static! {
     pub static ref MACHINE_USER: String = env::var("USER").unwrap();
-    pub static ref BUILD_LOG_BASE_URL: String = format!("https://csclub.uwaterloo.ca/~{}/build-logs", *MACHINE_USER);
+    pub static ref BUILD_LOG_BASE_URL: String =
+        format!("https://csclub.uwaterloo.ca/~{}/build-logs", *MACHINE_USER);
 }
 
 pub const COMMENT_JOB_START: &'static str = ":running_man: Start running build job";

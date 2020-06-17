@@ -68,7 +68,6 @@ impl JobRegistry {
 pub async fn process_job(job_id: &Uuid, job_registry: Arc<RwLock<JobRegistry>>) {
     info!("Starting job {}", &job_id);
 
-    let mut succeed = false;
     let job: Arc<RwLock<JobDesc>>;
 
     {
@@ -81,54 +80,14 @@ pub async fn process_job(job_id: &Uuid, job_registry: Arc<RwLock<JobRegistry>>) 
         }
     }
 
-    {
-        let mut job = job.write().await;
-        job.status = JobStatus::Running;
-    }
+    job.write().await.status = JobStatus::Running;
 
-    let copy_job: JobDesc;
-    {
-        let job = &*job.read().await;
-
-        /*
-           Important: We can't pass job directly into start_build_job, otherwise we will
-           have a deadlock. We want to update the JobDesc for the job with the PID of the
-           running process, but since we have the read lock, we can't acquire the write lock.
-
-           If we want to avoid having to request the read lock everytime we need it, we should
-           duplicate the current state (info) of the JobDesc. We may want to change this later
-           if we change more than the PID info while running the job.
-        */
-        copy_job = job.clone();
-    }
-
-    if let Err(e) = start_build_job(&copy_job, &job_registry).await {
+    if let Err(e) = start_build_job(&job).await {
         error!("job {} failed due to: {}", &job_id, e);
-    } else {
-        succeed = true;
     }
 
-    {
-        let mut job = job.write().await;
-
-        /*
-           We don't want to remove the head_ref key from the cancelled
-           job if the JobStatus is Canceled because when a job is Canceled,
-           a new job is started with the same key. ie: removing the key results
-           in removing a running job not the canceled job.
-        */
-        if job.status != JobStatus::Canceled {
-            {
-                let mut job_registry = job_registry.write().await;
-                job_registry.running_jobs.remove(&job.head_ref.clone());
-            }
-        }
-
-        if succeed {
-            job.status = JobStatus::Finished;
-        } else {
-            job.status = JobStatus::Failed;
-        }
+    if job.read().await.status == JobStatus::Canceled {
+        job_registry.write().await.running_jobs.remove(&job.read().await.head_ref.clone());
     }
 }
 
@@ -153,63 +112,89 @@ async fn job_failure_handler<T: std::fmt::Display>(
     Ok(())
 }
 
-async fn run_and_build(job: &JobDesc, job_registry: &Arc<RwLock<JobRegistry>>) -> Result<(), String> {
+async fn run_and_build(job: &Arc<RwLock<JobDesc>>) -> Result<(), String> {
     // TODO(azhng): figure out how to perform additional cleanup.
 
-    let log_file_name = format!("{}/{}/{}", env::var("HOME").unwrap(), config::SEXXI_LOG_FILE_DIR, &job.id);
+    let log_file_name = format!("{}/{}/{}", env::var("HOME").unwrap(), config::SEXXI_LOG_FILE_DIR, &job.read().await.id);
     let log_file_path = Path::new(&log_file_name);
     info!("Creating log file at: {}", &log_file_name);
     let mut log_file = File::create(&log_file_path).unwrap();
-    let bot_ref = format!("bot-{}", &job.head_ref);
+    let bot_ref = format!("bot-{}", &job.read().await.head_ref);
 
-    if let Err(e) = api::update_commit_status(&job.sha, api::COMMIT_PENDING, "Building job started", &job.build_log_url()).await {
+    if let Err(e) = api::update_commit_status(&job.read().await.sha, api::COMMIT_PENDING, "Building job started", &job.read().await.build_log_url()).await {
         return Err(format!("unable to update commit status for failed job: {}", e));
     }
 
 
-    if let Err(e) = cmd::remote_git_reset_branch(&job.id, &mut log_file, job_registry).await {
-        return job_failure_handler("unable to reset branch", &job, e).await;
+    if let Err(e) = cmd::remote_git_reset_branch(&mut log_file).await {
+        return job_failure_handler("unable to reset branch", &*job.read().await, e).await;
     }
 
-    if let Err(e) = cmd::remote_git_fetch_upstream(&job.id, &mut log_file, job_registry).await {
-        return job_failure_handler("unable to fetch upstream", &job, e).await;
+    if let Err(e) = cmd::remote_git_fetch_upstream(&mut log_file).await {
+        return job_failure_handler("unable to fetch upstream", &*job.read().await, e).await;
     }
 
-    if let Err(e) = cmd::remote_git_checkout_sha(&job.id, &job.sha, &bot_ref, &mut log_file, job_registry).await {
-        return job_failure_handler("unable to check out commit", &job, e).await;
+    if let Err(e) = cmd::remote_git_checkout_sha(&job.read().await.sha, &bot_ref, &mut log_file).await {
+        return job_failure_handler("unable to check out commit", &*job.read().await, e).await;
     }
 
-    if let Err(e) = cmd::remote_git_rebase_upstream(&job.id, &mut log_file, job_registry).await {
-        return job_failure_handler("unable to rebase against upstream", &job, e).await;
+    if let Err(e) = cmd::remote_git_rebase_upstream(&mut log_file).await {
+        return job_failure_handler("unable to rebase against upstream", &*job.read().await, e).await;
     }
 
     // TODO(azhng): make this a runtime decision.
     //info!("Skipping running test for development");
-    if let Err(e) = cmd::remote_test_rust_repo(&job.id, &mut log_file, job_registry).await {
-        cmd::remote_git_reset_branch(&job.id, &mut log_file, job_registry).await.expect("Ok");
-        cmd::remote_git_delete_branch(&job.id, &bot_ref, &mut log_file, job_registry).await.expect("Ok");
-        return job_failure_handler("unit test failed", &job, e).await;
+    if job.read().await.status != JobStatus::Canceled {
+        let mut succeed = false;
+        let mut err = String::from("");
+        match cmd::remote_test_rust_repo(&mut log_file).await {
+            Ok(test_process) => {
+                job.write().await.pid = test_process.id();
+                let result = test_process.wait_with_output().expect("Ok");
+                if !result.status.success() {
+                    if result.status.to_string() == "exit code: 130" {
+                        err = format!("job canceled");
+                        job.write().await.status = JobStatus::Canceled;
+                    } else {
+                        err = format!("unit test failed: {}", result.status);
+                        job.write().await.status = JobStatus::Failed;
+                    }
+                } else {
+                    job.write().await.status = JobStatus::Finished;
+                    succeed = true;
+                }
+            },
+            Err(e) => {
+                err = format!("unable to start testing process: {}", e);
+            }
+        }
+
+        if !succeed {
+            cmd::remote_git_reset_branch(&mut log_file).await.expect("Ok");
+            cmd::remote_git_delete_branch(&bot_ref, &mut log_file).await.expect("Ok");
+            return job_failure_handler("unit test failed", &*job.read().await, err).await;
+        }
     }
 
-    if let Err(e) = cmd::remote_git_push(&job.id, &bot_ref, &mut log_file, job_registry).await {
-        return job_failure_handler("unable to push bot branch", &job, e).await;
+    if let Err(e) = cmd::remote_git_push(&bot_ref, &mut log_file).await {
+        return job_failure_handler("unable to push bot branch", &*job.read().await, e).await;
     }
 
-    if let Err(e) = cmd::remote_git_reset_branch(&job.id, &mut log_file, job_registry).await {
-        return job_failure_handler("unable to reset branch for clean up", &job, e).await;
+    if let Err(e) = cmd::remote_git_reset_branch(&mut log_file).await {
+        return job_failure_handler("unable to reset branch for clean up", &*job.read().await, e).await;
     }
 
-    if let Err(e) = cmd::remote_git_delete_branch(&job.id, &bot_ref, &mut log_file, job_registry).await {
-        return job_failure_handler("unable to delete bot branch", &job, e).await;
+    if let Err(e) = cmd::remote_git_delete_branch(&bot_ref, &mut log_file).await {
+        return job_failure_handler("unable to delete bot branch", &*job.read().await, e).await;
     }
 
-    let msg = format!("{}, access build log [here]({})", config::COMMENT_JOB_DONE, job.build_log_url());
+    let msg = format!("{}, access build log [here]({})", config::COMMENT_JOB_DONE, job.read().await.build_log_url());
     info!("{}", &msg);
-    if let Err(e) = api::post_comment(&msg, job.pr_num).await {
+    if let Err(e) = api::post_comment(&msg, job.read().await.pr_num).await {
         warn!("failed to post comment for job completion: {}", e);
     }
 
-    if let Err(e) = api::update_commit_status(&job.sha, api::COMMIT_SUCCESS, &msg, &job.build_log_url()).await {
+    if let Err(e) = api::update_commit_status(&job.read().await.sha, api::COMMIT_SUCCESS, &msg, &job.read().await.build_log_url()).await {
         return Err(format!("unable to update commit status for failed job: {}", e));
     }
 
@@ -219,10 +204,13 @@ async fn run_and_build(job: &JobDesc, job_registry: &Arc<RwLock<JobRegistry>>) -
 }
 
 
-async fn start_build_job(job: &JobDesc, job_registry: &Arc<RwLock<JobRegistry>>) -> Result<(), String> {
-    let comment = format!("{}, job id: {}", config::COMMENT_JOB_START, &job.id);
-    if let Err(e) = api::post_comment(&comment, job.pr_num).await {
-        return Err(format!("failed to post comment to pr {}: {}", &job.pr_num, e));
+async fn start_build_job(job: &Arc<RwLock<JobDesc>>) -> Result<(), String> {
+    {
+        let job = &*job.read().await;
+        let comment = format!("{}, job id: [{}]({})", config::COMMENT_JOB_START, &job.id, job.build_log_url());
+        if let Err(e) = api::post_comment(&comment, job.pr_num).await {
+            return Err(format!("failed to post comment to pr {}: {}", &job.pr_num, e));
+        }
     }
-    run_and_build(job, job_registry).await
+    run_and_build(job).await
 }
