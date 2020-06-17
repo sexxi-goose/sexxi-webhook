@@ -118,21 +118,30 @@ async fn parse_and_handle(
                     let mut job_registry = job_registry.write().await;
                     job_registry.jobs.insert(job_id.clone(), Arc::new(RwLock::new(job)));
                     let c_job: Arc<RwLock<job::JobDesc>>;
-                    if let Some(j) = job_registry.jobs.get(&job_registry.running_jobs) {
-                        c_job = j.clone();
-                        let curr_job = c_job.read().await;
-                        if head_ref == curr_job.head_ref {
-                            info!("New job on same head_ref, killing current job");
-                            // [To-Do] Fix, could potentially kill a process which is already dead
-                            signal::kill(Pid::from_raw(curr_job.pid as i32), Signal::SIGKILL);
+                    let c_job_id: Uuid;
+                    if let Some(c_id) = job_registry.running_jobs.get(head_ref.clone()) {
+                        c_job_id = c_id.clone();
+                        if let Some(j) = job_registry.jobs.get(&c_job_id) {
+                            c_job = j.clone();
+                            let curr_job = c_job.read().await;
+                            if head_ref == curr_job.head_ref {
+                                info!("New job on same head_ref, killing current job");
+                                // [To-Do] Fix, could potentially kill a process which is already dead
+                                signal::kill(Pid::from_raw(curr_job.pid as i32), Signal::SIGKILL);
+                            }
                         }
                     }
 
-                    job_registry.running_jobs = job_id.clone();
+                    job_registry.running_jobs.insert(head_ref.clone().to_string(), job_id.clone());
                 }
 
                 if let Err(e) = sender.send(job_id).await {
                     error!("failed to send job id to job runner: {}", e);
+                    {
+                        let mut job_registry = job_registry.write().await;
+                        job_registry.running_jobs.remove(head_ref.clone());
+                    }
+
                     return Ok::<_, hyper::Error>(gen_response(500));
                 };
             },

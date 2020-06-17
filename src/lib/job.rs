@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use super::{api, config, cmd};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum JobStatus {
     Created,
     Running,
@@ -53,15 +53,14 @@ impl JobDesc {
 #[derive(Debug)]
 pub struct JobRegistry {
     pub jobs : HashMap<Uuid, Arc<RwLock<JobDesc>>>,
-    pub running_jobs : Uuid, //head_ref to uuid
-    //pub running_jobs : HashMap<String,Uuid>, //head_ref to uuid
+    pub running_jobs : HashMap<String,Uuid>, //head_ref to uuid
 }
 
 impl JobRegistry {
     pub fn new() -> JobRegistry {
         JobRegistry {
             jobs: HashMap::new(),
-            running_jobs: Uuid::new_v4(),
+            running_jobs: HashMap::new(),
         }
     }
 }
@@ -111,6 +110,20 @@ pub async fn process_job(job_id: &Uuid, job_registry: Arc<RwLock<JobRegistry>>) 
 
     {
         let mut job = job.write().await;
+
+        /*
+           We don't want to remove the head_ref key from the cancelled
+           job if the JobStatus is Canceled because when a job is Canceled,
+           a new job is started with the same key. ie: removing the key results
+           in removing a running job not the canceled job.
+        */
+        if (job.status != JobStatus::Canceled) {
+            {
+                let mut job_registry = job_registry.write().await;
+                job_registry.running_jobs.remove(&job.head_ref.clone());
+            }
+        }
+
         if succeed {
             job.status = JobStatus::Finished;
         } else {
@@ -154,39 +167,39 @@ async fn run_and_build(job: &JobDesc, job_registry: &Arc<RwLock<JobRegistry>>) -
     }
 
 
-    if let Err(e) = cmd::remote_git_reset_branch(&mut log_file, job_registry).await {
+    if let Err(e) = cmd::remote_git_reset_branch(&job.id, &mut log_file, job_registry).await {
         return job_failure_handler("unable to reset branch", &job, e).await;
     }
 
-    if let Err(e) = cmd::remote_git_fetch_upstream(&mut log_file, job_registry).await {
+    if let Err(e) = cmd::remote_git_fetch_upstream(&job.id, &mut log_file, job_registry).await {
         return job_failure_handler("unable to fetch upstream", &job, e).await;
     }
 
-    if let Err(e) = cmd::remote_git_checkout_sha(&job.sha, &bot_ref, &mut log_file, job_registry).await {
+    if let Err(e) = cmd::remote_git_checkout_sha(&job.id, &job.sha, &bot_ref, &mut log_file, job_registry).await {
         return job_failure_handler("unable to check out commit", &job, e).await;
     }
 
-    if let Err(e) = cmd::remote_git_rebase_upstream(&mut log_file, job_registry).await {
+    if let Err(e) = cmd::remote_git_rebase_upstream(&job.id, &mut log_file, job_registry).await {
         return job_failure_handler("unable to rebase against upstream", &job, e).await;
     }
 
     // TODO(azhng): make this a runtime decision.
     //info!("Skipping running test for development");
-    if let Err(e) = cmd::remote_test_rust_repo(&mut log_file, job_registry).await {
-        cmd::remote_git_reset_branch(&mut log_file, job_registry).await.expect("Ok");
-        cmd::remote_git_delete_branch(&bot_ref, &mut log_file, job_registry).await.expect("Ok");
+    if let Err(e) = cmd::remote_test_rust_repo(&job.id, &mut log_file, job_registry).await {
+        cmd::remote_git_reset_branch(&job.id, &mut log_file, job_registry).await.expect("Ok");
+        cmd::remote_git_delete_branch(&job.id, &bot_ref, &mut log_file, job_registry).await.expect("Ok");
         return job_failure_handler("unit test failed", &job, e).await;
     }
 
-    if let Err(e) = cmd::remote_git_push(&bot_ref, &mut log_file, job_registry).await {
+    if let Err(e) = cmd::remote_git_push(&job.id, &bot_ref, &mut log_file, job_registry).await {
         return job_failure_handler("unable to push bot branch", &job, e).await;
     }
 
-    if let Err(e) = cmd::remote_git_reset_branch(&mut log_file, job_registry).await {
+    if let Err(e) = cmd::remote_git_reset_branch(&job.id, &mut log_file, job_registry).await {
         return job_failure_handler("unable to reset branch for clean up", &job, e).await;
     }
 
-    if let Err(e) = cmd::remote_git_delete_branch(&bot_ref, &mut log_file, job_registry).await {
+    if let Err(e) = cmd::remote_git_delete_branch(&job.id, &bot_ref, &mut log_file, job_registry).await {
         return job_failure_handler("unable to delete bot branch", &job, e).await;
     }
 
