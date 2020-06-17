@@ -127,7 +127,7 @@ async fn parse_and_handle(
                             if head_ref == curr_job.head_ref {
                                 info!("New job on same head_ref, killing current job");
                                 // [To-Do] Fix, could potentially kill a process which is already dead
-                                signal::kill(Pid::from_raw(curr_job.pid as i32), Signal::SIGKILL);
+                                signal::kill(Pid::from_raw(curr_job.pid as i32), Signal::SIGINT);
                             }
                         }
                     }

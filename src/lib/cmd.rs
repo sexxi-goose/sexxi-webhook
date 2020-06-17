@@ -35,10 +35,11 @@ async fn remote_cmd(job_id: &Uuid, args: &mut Vec<&str>, output: &mut File, job_
             let result = child.wait_with_output().expect("Ok");
             if !result.status.success() {
                 /*
-                   Check if Signal::SIGKILL was received. If it was the case
+                   Check if Signal::SIGINT was received. If it was the case
                    this is probably because the the job was canceled.
+                   exit code 130 is a result of Control-C/SIGINT
                 */
-                if result.status.to_string() == "signal: 9" {
+                if result.status.to_string() == "exit code: 130" {
                     let job_registry = job_registry.read().await;
                     let job: Arc<RwLock<job::JobDesc>>;
                     if let Some(j) = job_registry.jobs.get(job_id) {

@@ -86,7 +86,7 @@ pub async fn process_job(job_id: &Uuid, job_registry: Arc<RwLock<JobRegistry>>) 
         job.status = JobStatus::Running;
     }
 
-    let copy_job : JobDesc;
+    let copy_job: JobDesc;
     {
         let job = &*job.read().await;
 
@@ -117,7 +117,7 @@ pub async fn process_job(job_id: &Uuid, job_registry: Arc<RwLock<JobRegistry>>) 
            a new job is started with the same key. ie: removing the key results
            in removing a running job not the canceled job.
         */
-        if (job.status != JobStatus::Canceled) {
+        if job.status != JobStatus::Canceled {
             {
                 let mut job_registry = job_registry.write().await;
                 job_registry.running_jobs.remove(&job.head_ref.clone());
