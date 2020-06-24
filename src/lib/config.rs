@@ -2,8 +2,7 @@ use lazy_static::lazy_static;
 use std::env;
 
 pub const REVIEW_REQUESTED: &'static str = "review_requested";
-pub const REVIEW_REQUESTED_REMOVED: &'static str = "review_requested_removed";
-
+pub const REVIEW_REQUEST_REMOVED: &'static str = "review_request_removed";
 pub const REVIEWER: &'static str = "sexxi-bot";
 // TODO(azhng): const REPO: &'static str = "rust";
 
@@ -19,6 +18,7 @@ pub const SEXXI_TEST_PROJECT: &'static str = "sexxi-webhook-test";
 
 pub const SEXXI_REMOTE_HOST: &'static str = "sorbitol";
 pub const SEXXI_LOG_FILE_DIR: &'static str = "www/build-logs";
+pub const SEXXI_TIMEOUT_JOB_IN_SEC: u64 = 60 * 60 * 2;
 
 lazy_static! {
     pub static ref MACHINE_USER: String = env::var("USER").unwrap();
