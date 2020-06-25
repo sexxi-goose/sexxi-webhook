@@ -146,6 +146,28 @@ async fn parse_and_handle(
                     return Ok::<_, hyper::Error>(gen_response(500));
                 };
             },
+            config::REVIEW_REQUEST_REMOVED => {
+                let head_ref = json["pull_request"]["head"]["ref"].as_str().unwrap();
+                let mut job_registry = job_registry.write().await;
+
+                let c_job: Arc<RwLock<job::JobDesc>>;
+                let c_job_id: Uuid;
+                if let Some(c_id) = job_registry.running_jobs.get(head_ref.clone()) {
+                    c_job_id = c_id.clone();
+                    if let Some(j) = job_registry.jobs.get(&c_job_id) {
+                        c_job = j.clone();
+                        let curr_job = c_job.read().await;
+                        if head_ref == curr_job.head_ref {
+                            info!("Request to run job on {} has been removed. Cancelling running job.",head_ref);
+                            // [To-Do] Fix, could potentially kill a process which is already dead
+                            signal::kill(Pid::from_raw(curr_job.pid as i32), Signal::SIGINT);
+
+                            // Remove cancelled job
+                            job_registry.running_jobs.remove(head_ref);
+                        }
+                    }
+                }
+            },
             _ => {
                 warn!("Action: {} not handled", action);
             }

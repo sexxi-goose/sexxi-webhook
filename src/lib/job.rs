@@ -86,9 +86,10 @@ pub async fn process_job(job_id: &Uuid, job_registry: Arc<RwLock<JobRegistry>>) 
         error!("job {} failed due to: {}", &job_id, e);
     }
 
-    if job.read().await.status == JobStatus::Canceled {
-        job_registry.write().await.running_jobs.remove(&job.read().await.head_ref.clone());
-    }
+    // We should be removing the job from the running_jobs list when the job is no more running
+    info!("Job is no longer running, remove the job from the running_jobs list");
+    job_registry.write().await.running_jobs.remove(&job.read().await.head_ref.clone());
+
 }
 
 async fn job_failure_handler<T: std::fmt::Display>(
@@ -203,7 +204,6 @@ async fn run_and_build(job: &Arc<RwLock<JobDesc>>) -> Result<(), String> {
     Ok(())
 }
 
-
 async fn start_build_job(job: &Arc<RwLock<JobDesc>>) -> Result<(), String> {
     {
         let job = &*job.read().await;
@@ -212,5 +212,6 @@ async fn start_build_job(job: &Arc<RwLock<JobDesc>>) -> Result<(), String> {
             return Err(format!("failed to post comment to pr {}: {}", &job.pr_num, e));
         }
     }
+
     run_and_build(job).await
 }
